@@ -1,6 +1,6 @@
 <?php
 /**
- * 2007-2019 PrestaShop and Contributors
+ * 2007-2020 PrestaShop and Contributors
  *
  * NOTICE OF LICENSE
  *
@@ -19,10 +19,11 @@
  * needs please refer to https://www.prestashop.com for more information.
  *
  * @author    PrestaShop SA <contact@prestashop.com>
- * @copyright 2007-2019 PrestaShop SA and Contributors
+ * @copyright 2007-2020 PrestaShop SA and Contributors
  * @license   https://opensource.org/licenses/OSL-3.0 Open Software License (OSL 3.0)
  * International Registered Trademark & Property of PrestaShop SA
  */
+
 use PrestaShop\PrestaShop\Adapter\AddressFactory;
 use PrestaShop\PrestaShop\Adapter\Cache\CacheAdapter;
 use PrestaShop\PrestaShop\Adapter\Customer\CustomerDataProvider;
@@ -764,9 +765,8 @@ class CartCore extends ObjectModel
                             $result[$rowIndex]['is_gift'] = false;
                         }
 
-                        if (
-                            $row['id_product'] == $gift['gift_product'] &&
-                            $row['id_product_attribute'] == $gift['gift_product_attribute']
+                        if ($row['id_product'] == $gift['gift_product']
+                            && $row['id_product_attribute'] == $gift['gift_product_attribute']
                         ) {
                             $row['is_gift'] = true;
                             $result[$rowIndex] = $row;
@@ -789,7 +789,10 @@ class CartCore extends ObjectModel
 
                 $additionalRow = Product::getProductProperties((int) $this->id_lang, $row);
                 $row['reduction'] = $additionalRow['reduction'];
+                /* reduction_without_tax fix by JJ Prus */
+                $additionalRow['reduction_without_tax'] = 0;
                 $row['reduction_without_tax'] = $additionalRow['reduction_without_tax'];
+                /* reduction_without_tax fix by JJ Prus */
                 $row['price_without_reduction'] = $additionalRow['price_without_reduction'];
                 $row['specific_prices'] = $additionalRow['specific_prices'];
                 unset($additionalRow);
@@ -977,13 +980,13 @@ class CartCore extends ObjectModel
             case Order::ROUND_ITEM:
             default:
                 $row['total'] = Tools::ps_round(
-                        $row['price_with_reduction_without_tax'],
-                        _PS_PRICE_COMPUTE_PRECISION_
-                    ) * $productQuantity;
+                    $row['price_with_reduction_without_tax'],
+                    _PS_PRICE_COMPUTE_PRECISION_
+                ) * $productQuantity;
                 $row['total_wt'] = Tools::ps_round(
-                        $row['price_with_reduction'],
-                        _PS_PRICE_COMPUTE_PRECISION_
-                    ) * $productQuantity;
+                    $row['price_with_reduction'],
+                    _PS_PRICE_COMPUTE_PRECISION_
+                ) * $productQuantity;
 
                 break;
         }
@@ -1375,6 +1378,25 @@ class CartCore extends ObjectModel
             return false;
         }
 
+        /* JJ Prus */
+        if (empty(Tools::getValue('discretion')) && Tools::getValue('dim') && $id_customization) {
+            $id_customization = 0;
+        } elseif (Tools::getValue('discretion') && Tools::getValue('dim') && $id_customization) {
+            $cartProductQuantity = $this->getProductQuantity(
+                $id_product,
+                $id_product_attribute,
+                (int) $id_customization,
+                (int) $id_address_delivery
+            );
+            if (!empty($cartProductQuantity['quantity'])) {
+                $sql = 'select id_customization from ' . pSQL(_DB_PREFIX_) . 'customized_data ORDER BY id_customization DESC LIMIT 1';
+                $latestcustomization = Db::getInstance()->executeS($sql);
+                $id_customization = $latestcustomization[0]['id_customization'];
+                $id_customization = $id_customization + 1;
+            }
+        }
+        /* JJ Prus */
+
         /* Check if the product is already in the cart */
         $cartProductQuantity = $this->getProductQuantity(
             $id_product,
@@ -1474,7 +1496,13 @@ class CartCore extends ObjectModel
             CartRule::autoAddToCart($context);
         }
 
-        if ($product->customizable) {
+        /* JJ Prus */
+        if (($product->customizable) || (Tools::getValue('dim'))) {
+            $sql = 'select id_customization from ' . pSQL(_DB_PREFIX_) . 'customized_data ORDER BY id_customization DESC LIMIT 1';
+            $latestcustomization = Db::getInstance()->executeS($sql);
+            $id_customization = $latestcustomization[0]['id_customization'];
+            // if ($product->customizable) {
+            /* JJ Prus */
             return $this->_updateCustomizationQuantity(
                 (int) $quantity,
                 (int) $id_customization,
@@ -1554,6 +1582,80 @@ class CartCore extends ObjectModel
 
         return true;
     }
+
+    /* JJ Prus */
+    /**
+     * Add customization item to database.
+     *
+     * @param int $id_product Product ID
+     * @param int $id_product_attribute ProductAttribute ID
+     * @param int $index Index
+     * @param int $type Type enum
+     *                  - Product::CUSTOMIZE_FILE
+     *                  - Product::CUSTOMIZE_TEXTFIELD
+     * @param string $field Field
+     * @param int $quantity Quantity
+     *
+     * @return bool Success
+     */
+    public function _addCustomization2($id_product, $id_product_attribute, $index, $type, $field, $quantity, $dimension_price)
+    {
+        $exising_customization = Db::getInstance()->executeS(
+            'SELECT cu.`id_customization`, cd.`index`, cd.`value`, cd.`type` FROM `' . _DB_PREFIX_ . 'customization` cu
+            LEFT JOIN `' . _DB_PREFIX_ . 'customized_data` cd
+            ON cu.`id_customization` = cd.`id_customization`
+            WHERE cu.id_cart = ' . (int) $this->id . '
+            AND cu.id_product = ' . (int) $id_product . '
+            AND in_cart = 0'
+        );
+
+        if ($exising_customization) {
+            // If the customization field is alreay filled, delete it
+            foreach ($exising_customization as $customization) {
+                if ($customization['type'] == $type && $customization['index'] == $index) {
+                    Db::getInstance()->execute('
+                        DELETE FROM `' . _DB_PREFIX_ . 'customized_data`
+                        WHERE id_customization = ' . (int) $customization['id_customization'] . '
+                        AND type = ' . (int) $customization['type'] . '
+                        AND `index` = ' . (int) $customization['index']);
+                    if ($type == Product::CUSTOMIZE_FILE) {
+                        @unlink(_PS_UPLOAD_DIR_ . $customization['value']);
+                        @unlink(_PS_UPLOAD_DIR_ . $customization['value'] . '_small');
+                    }
+                    break;
+                }
+            }
+            $id_customization = $exising_customization[0]['id_customization'];
+        } else {
+            /* JJ Prus */
+            if ($this->id) {
+                /* JJ Prus */
+                Db::getInstance()->execute(
+                    'INSERT INTO `' . _DB_PREFIX_ . 'customization` (`id_cart`, `id_product`, `id_product_attribute`, `quantity`)
+                VALUES (' . (int) $this->id . ', ' . (int) $id_product . ', ' . (int) $id_product_attribute . ', ' . (int) $quantity . ')'
+                );
+                $id_customization = Db::getInstance()->Insert_ID();
+                /* JJ Prus */
+            }
+            /* JJ Prus */
+        }
+
+        /* JJ Prus */
+        if ($id_customization) {
+            /* JJ Prus */
+            $query = 'INSERT INTO `' . _DB_PREFIX_ . 'customized_data` (`id_customization`, `type`, `index`, `value`, `dimension_price`)
+            VALUES (' . (int) $id_customization . ', ' . (int) $type . ', ' . (int) $index . ', \'' . pSQL($field) . '\'' . ', ' . (float) $dimension_price . ')';
+
+            if (!Db::getInstance()->execute($query)) {
+                return false;
+            }
+            /* JJ Prus */
+        }
+        /* JJ Prus */
+
+        return true;
+    }
+    /* JJ Prus */
 
     /**
      * Add customization item to database.
@@ -1766,8 +1868,7 @@ class CartCore extends ObjectModel
         $preservedGifts = array($id_product . '-' . $id_product_attribute => 0);
 
         foreach ($gifts as $gift) {
-            if (
-                (int) $gift['id_product_attribute'] === $id_product_attribute
+            if ((int) $gift['id_product_attribute'] === $id_product_attribute
                 && (int) $gift['id_product'] === $id_product
             ) {
                 ++$preservedGifts[$id_product . '-' . $id_product_attribute];
@@ -2714,9 +2815,9 @@ class CartCore extends ObjectModel
                 $best_price_carrier[$id_carrier]['product_list'] = array_merge($best_price_carrier[$id_carrier]['product_list'], $packages[$id_package]['product_list']);
                 $best_price_carrier[$id_carrier]['instance'] = $carriers_instance[$id_carrier];
                 $real_best_price = !isset($real_best_price) || $real_best_price > $carriers_price[$id_address][$id_package][$id_carrier]['with_tax'] ?
-                    $carriers_price[$id_address][$id_package][$id_carrier]['with_tax'] : $real_best_price;
+                $carriers_price[$id_address][$id_package][$id_carrier]['with_tax'] : $real_best_price;
                 $real_best_price_wt = !isset($real_best_price_wt) || $real_best_price_wt > $carriers_price[$id_address][$id_package][$id_carrier]['without_tax'] ?
-                    $carriers_price[$id_address][$id_package][$id_carrier]['without_tax'] : $real_best_price_wt;
+                $carriers_price[$id_address][$id_package][$id_carrier]['without_tax'] : $real_best_price_wt;
             }
 
             // Add the delivery option with best price as best price
@@ -2980,7 +3081,7 @@ class CartCore extends ObjectModel
                     $name = $carrier['instance']->name;
                     $delay = $carrier['instance']->delay;
                     $delay = isset($delay[Context::getContext()->language->id]) ?
-                        $delay[Context::getContext()->language->id] : $delay[(int) Configuration::get('PS_LANG_DEFAULT')];
+                    $delay[Context::getContext()->language->id] : $delay[(int) Configuration::get('PS_LANG_DEFAULT')];
                 }
                 if (isset($carrier['logo'])) {
                     $img = $carrier['logo'];
@@ -3040,7 +3141,7 @@ class CartCore extends ObjectModel
         $elm = explode($delimiter, $string);
         $max = max($elm);
 
-        return strlen($max) . implode(str_repeat('0', strlen($max) + 1), $elm);
+        return Tools::strlen($max) . implode(str_repeat('0', Tools::strlen($max) + 1), $elm);
     }
 
     /**
@@ -3049,7 +3150,7 @@ class CartCore extends ObjectModel
     public static function desintifier($int, $delimiter = ',')
     {
         $delimiter_len = $int[0];
-        $int = strrev(substr($int, 1));
+        $int = strrev(Tools::substr($int, 1));
         $elm = explode(str_repeat('0', $delimiter_len + 1), $int);
 
         return strrev(implode($delimiter, $elm));
@@ -3397,7 +3498,7 @@ class CartCore extends ObjectModel
             // Get id zone
             if (!$this->isMultiAddressDelivery()
                 && isset($this->id_address_delivery) // Be carefull, id_address_delivery is not usefull one 1.5
-                && $this->id_address_delivery
+                 && $this->id_address_delivery
                 && Customer::customerHasAddress($this->id_customer, $this->id_address_delivery)
             ) {
                 $id_zone = Address::getZoneById((int) $this->id_address_delivery);
@@ -3929,14 +4030,13 @@ class CartCore extends ObjectModel
         }
 
         foreach ($this->getProducts() as $product) {
-            if (
-                !$this->allow_seperated_package &&
-                !$product['allow_oosp'] &&
-                StockAvailable::dependsOnStock($product['id_product']) &&
-                $product['advanced_stock_management'] &&
-                (bool) Context::getContext()->customer->isLogged() &&
-                ($delivery = $this->getDeliveryOption()) &&
-                !empty($delivery)
+            if (!$this->allow_seperated_package
+                && !$product['allow_oosp']
+                && StockAvailable::dependsOnStock($product['id_product'])
+                && $product['advanced_stock_management']
+                && (bool) Context::getContext()->customer->isLogged()
+                && ($delivery = $this->getDeliveryOption())
+                && !empty($delivery)
             ) {
                 $product['stock_quantity'] = StockManager::getStockByCarrier(
                     (int) $product['id_product'],
@@ -3945,10 +4045,9 @@ class CartCore extends ObjectModel
                 );
             }
 
-            if (
-                !$product['active'] ||
-                !$product['available_for_order'] ||
-                (!$product['allow_oosp'] && $product['stock_quantity'] < $product['cart_quantity'])
+            if (!$product['active']
+                || !$product['available_for_order']
+                || (!$product['allow_oosp'] && $product['stock_quantity'] < $product['cart_quantity'])
             ) {
                 return $returnProductOnFailure ? $product : false;
             }
@@ -4121,6 +4220,12 @@ class CartCore extends ObjectModel
         return $this->_addCustomization($id_product, 0, $index, $type, $text_value, 0);
     }
 
+    /* JJ Prus */
+    public function addTextFieldToProductOverride($id_product, $id_product_attribute, $index, $type, $text_value, $dimension_price, $quantity = 0)
+    {
+        return $this->_addCustomization2($id_product, $id_product_attribute, $index, $type, $text_value, $quantity, $dimension_price);
+    }
+    /* JJ Prus */
     /**
      * Add customer's pictures.
      *
@@ -4315,11 +4420,11 @@ class CartCore extends ObjectModel
 
         // Backward compatibility: if true set customizations quantity to 0, they will be updated in Cart::_updateCustomizationQuantity
         $new_customization_method = (int) Db::getInstance()->getValue(
-                '
+            '
             SELECT COUNT(`id_customization`) FROM `' . _DB_PREFIX_ . 'cart_product`
             WHERE `id_cart` = ' . (int) $this->id .
-                ' AND `id_customization` != 0'
-            ) > 0;
+            ' AND `id_customization` != 0'
+        ) > 0;
 
         // Insert new customizations
         $custom_ids = array();
@@ -4354,8 +4459,8 @@ class CartCore extends ObjectModel
                 }
 
                 $sql_custom_data .= '(' . (int) $custom_ids[$custom['id_customization']] . ', ' . (int) $custom['type'] . ', ' .
-                    (int) $custom['index'] . ', \'' . pSQL($customized_value) . '\', ' .
-                    (int) $custom['id_module'] . ', ' . (float) $custom['price'] . ', ' . (float) $custom['weight'] . ')';
+                (int) $custom['index'] . ', \'' . pSQL($customized_value) . '\', ' .
+                (int) $custom['id_module'] . ', ' . (float) $custom['price'] . ', ' . (float) $custom['weight'] . ')';
             }
             Db::getInstance()->execute($sql_custom_data);
         }
@@ -4420,9 +4525,9 @@ class CartCore extends ObjectModel
 
             foreach ($values as $value) {
                 $query .= '(' . (int) $this->id . ', ' . (int) $value['id_product'] . ', ' .
-                    (isset($value['id_product_attribute']) ? (int) $value['id_product_attribute'] : 'NULL') . ', ' .
-                    (isset($value['id_address_delivery']) ? (int) $value['id_address_delivery'] : 0) . ', ' .
-                    (int) $value['quantity'] . ', NOW(), ' . (int) Context::getContext()->shop->id . '),';
+                (isset($value['id_product_attribute']) ? (int) $value['id_product_attribute'] : 'NULL') . ', ' .
+                (isset($value['id_address_delivery']) ? (int) $value['id_address_delivery'] : 0) . ', ' .
+                (int) $value['quantity'] . ', NOW(), ' . (int) Context::getContext()->shop->id . '),';
             }
 
             Db::getInstance()->execute(rtrim($query, ','));
